@@ -1,14 +1,23 @@
 # ── Imports & Setup (same as before) ─────────────────────────────────────────
+from __future__ import annotations
+
+# ── Imports & Setup ─────────────────────────────────────────────────────────
 import datetime
 import math
+import os
 import sqlite3
 import uuid
+from io import BytesIO
 from pathlib import Path
 
+import cloudinary
+import cloudinary.uploader
 import folium
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
+from dotenv import load_dotenv
 from geopy.exc import GeocoderUnavailable, GeopyError
 from geopy.geocoders import Nominatim
 from PIL import Image
@@ -16,6 +25,16 @@ from streamlit_folium import st_folium
 
 import db
 from face_utils import cosine, get_embedding
+from social_search import scrape_profile_title, search_image
+
+# ── Env & Cloudinary config ────────────────────────────────────────────────
+load_dotenv()
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True,
+)
 
 st.set_page_config(page_title="Missing Person Finder", page_icon="🔍", layout="wide")
 
@@ -83,10 +102,11 @@ tabs = st.tabs(["📝 Register", "🔎 Search", "📂 My Cases", "🟢 Found Cas
 user_id = st.session_state.user_id
 username = st.session_state.username
 
-# ── 1) REGISTER MISSING PERSON ──────────────────────────────────────────────
+# ── 1) REGISTER MISSING PERSON ───────────────────────────────────────────
 with tabs[0]:
     st.markdown("### 📝 Register Missing Person")
     st.info(f"Logged in as **{username}**")
+
     with st.form("register_form", clear_on_submit=True):
         col_pic, col_meta = st.columns([1, 2])
         with col_pic:
@@ -98,19 +118,16 @@ with tabs[0]:
             loc = st.text_input("Last seen location* (address / city)")
             date = st.date_input("Last seen date*", value=datetime.date.today())
             notes = st.text_area("Additional notes")
-
         st.markdown("#### Contact & Address")
         contact_name = st.text_input("Contact person name*")
         contact_number = st.text_input("Contact phone number*")
         relation = st.text_input("Relation to missing person")
         address = st.text_area("Full address", height=70)
         aadhaar = st.text_input("Aadhaar number (optional)")
-
         submitted = st.form_submit_button("💾 Save Record")
 
     if submitted:
-        required = [img_file, name, age, gender, loc, contact_name, contact_number]
-        if not all(required):
+        if not all([img_file, name, age, gender, loc, contact_name, contact_number]):
             st.error("Please fill all required fields (marked with *).")
             st.stop()
 
@@ -122,71 +139,96 @@ with tabs[0]:
         except (GeocoderUnavailable, GeopyError):
             st.warning("⚠️ Geocoding unavailable – coordinates not saved")
 
-        if not (gps_lat and gps_lon):
-            st.warning("Couldn’t geocode the address – map preview skipped.")
-
+        img_bytes = img_file.getbuffer()
         try:
-            emb = get_embedding(img_file.read())
-            photo_path = PHOTOS_DIR / f"{uuid.uuid4()}.jpg"
-            photo_path.write_bytes(img_file.getbuffer())
-            db.add_person({
-                "name": name, "age": age, "gender": gender,
-                "loc": loc, "gps_lat": gps_lat, "gps_lon": gps_lon,
-                "date": str(date), "notes": notes,
-                "photo_path": str(photo_path), "address": address,
-                "contact_name": contact_name, "contact_number": contact_number,
-                "aadhaar_number": aadhaar, "relation": relation,
-            }, emb, user_id)
-            st.success("✅ Record saved!")
-            if gps_lat and gps_lon:
-                st.markdown("#### 📍 Last Seen Location Map")
-                m = folium.Map(location=[gps_lat, gps_lon], zoom_start=14)
-                folium.Marker([gps_lat, gps_lon], tooltip=name).add_to(m)
-                show_map(m, key="register_preview", h=400, w=700)
+            emb = get_embedding(img_bytes)
+            cld_resp = cloudinary.uploader.upload(
+                BytesIO(img_bytes), folder="missing_finder", overwrite=True, resource_type="image"
+            )
+            photo_url = cld_resp["secure_url"]
 
-        except ValueError as e:
+            links = []
+            with st.spinner("Searching public web for this photo…"):
+                try:
+                    hits = search_image(img_bytes)
+                    links = [h["url"] for h in hits]
+                except Exception as e:
+                    st.warning(f"Image search failed: {e}")
+
+            db.add_person(
+                {
+                    "name": name,
+                    "age": age,
+                    "gender": gender,
+                    "loc": loc,
+                    "gps_lat": gps_lat,
+                    "gps_lon": gps_lon,
+                    "date": str(date),
+                    "notes": notes,
+                    "photo_path": photo_url,
+                    "address": address,
+                    "contact_name": contact_name,
+                    "contact_number": contact_number,
+                    "aadhaar_number": aadhaar,
+                    "relation": relation,
+                    "links": "\n".join(links),
+                },
+                emb,
+                user_id,
+            )
+            st.success("✅ Record saved!")
+
+            if links:
+                with st.expander("🌐 Possible social‑media pages"):
+                    for url in links:
+                        st.markdown(f"- [{url}]({url})")
+
+            if gps_lat and gps_lon:
+                m = folium.Map([gps_lat, gps_lon], zoom_start=14)
+                folium.Marker([gps_lat, gps_lon], tooltip=name).add_to(m)
+                show_map(m, key="register_preview")
+        except Exception as e:
             st.error(str(e))
 
-# ── 2) SEARCH BY PHOTO ───────────────────────────────────────────────────────
+# ── 2) SEARCH BY PHOTO ────────────────────────────────────────────────────
 with tabs[1]:
     st.markdown("### 🔎 Search by Photo")
     q_file = st.file_uploader("Upload photo to search", type=["jpg", "png"], key="search_query_pic")
-    strict = st.slider("Match strictness (HIGH = fewer matches)", 0.20, 0.60, 0.33, 0.01)
+    strict = st.slider("Match strictness (higher = stricter)", 0.20, 0.95, 0.33, 0.01)
 
     if q_file:
         try:
-            q_emb = get_embedding(q_file.read())
+            q_emb = get_embedding(q_file.getbuffer())
             matches = []
             for pid, nm, ag, gen, path, loc, gps_lat, gps_lon, emb_blob in db.all_persons():
                 if cosine(q_emb, np.frombuffer(emb_blob, dtype=np.float32)) >= strict:
                     matches.append((pid, nm, ag, gen, path, loc, gps_lat, gps_lon))
 
-            if matches:
+            if not matches:
+                st.info("No matches above threshold. Try lowering strictness.")
+            else:
                 st.success(f"Found {len(matches)} potential match(es)")
                 overview_coords = []
-
                 for pid, nm, ag, gen, path, loc, gps_lat, gps_lon in matches:
-                    with sqlite3.connect(db.DB_PATH) as conn:
-                        rel, c_name, c_num, addr, aad = conn.execute(
-                            "SELECT relation, contact_name, contact_number, address, aadhaar_number FROM persons WHERE id = ?",
-                            (pid,)
-                        ).fetchone()
-
-                    masked_aad = f"XXXX‑XXXX‑{aad[-4:]}" if aad else "—"
+                    rel, c_name, c_num, addr, aad, links = sqlite3.connect(db.DB_PATH).execute(
+                        "SELECT relation, contact_name, contact_number, address, aadhaar_number, links FROM persons WHERE id=?",
+                        (pid,),
+                    ).fetchone()
+                    masked = f"XXXX‑XXXX‑{aad[-4:]}" if aad else "—"
                     if gps_lat and gps_lon:
                         overview_coords.append((gps_lat, gps_lon, nm))
 
                     with st.container():
-                        col_img, col_info = st.columns([1, 3], gap="small")
-                        with col_img:
-                            st.image(Image.open(path), caption=f"ID {pid}", width=140)
-                        with col_info:
+                        ci, cf = st.columns([1, 3])
+                        with ci:
+                            st.image(path, width=140, caption=f"ID {pid}")
+                        with cf:
                             st.markdown(
-                                f"""**{nm}**, {ag} yrs — {gen}<br>
+                                f"""**{nm}**, {ag} yrs — {gen}<br>
                                 **Relation**: {rel or '—'}<br>
                                 **Contact**: {c_name or '—'} ({c_num or '—'})<br>
                                 **Address**: {addr or '—'}<br>
-                                **Aadhaar**: {masked_aad}<br>
+                                **Aadhaar**: {masked}<br>
                                 **Last seen**: {loc}""",
                                 unsafe_allow_html=True,
                             )
@@ -194,17 +236,14 @@ with tabs[1]:
                             m = folium.Map([gps_lat, gps_lon], zoom_start=11)
                             folium.Marker([gps_lat, gps_lon], popup=loc).add_to(m)
                             show_map(m, key=f"match_map_{pid}", h=200, w=260)
-                    st.markdown("---")
 
-                if overview_coords:
-                    ov_map = folium.Map(location=[overview_coords[0][0], overview_coords[0][1]], zoom_start=5)
-                    for lat, lon, title in overview_coords:
-                        folium.Marker([lat, lon], popup=title).add_to(ov_map)
-                    st.markdown("#### 🗺️ Overview of all matched locations")
-                    show_map(ov_map, key="overview_map", h=250, w=350)
-            else:
-                st.info("No matches above threshold. Try lowering strictness.")
-        except ValueError as err:
+                        if links:
+                            with st.expander("🌐 Public social-media links"):
+                                for link in links.split("\n"):
+                                    st.markdown(f"- [{link}]({link})")
+
+                    st.markdown("---")
+        except Exception as err:
             st.error(str(err))
 
 # ── 3) MY SUBMITTED CASES ─────────────────────────────────────────────────────
@@ -219,7 +258,7 @@ with tabs[2]:
             with st.container():
                 c1, c2 = st.columns([1, 3])
                 with c1:
-                    st.image(Image.open(row['photo_path']), width=140, caption=f"{row['name']}")
+                    st.image(row['photo_path'], width=140, caption=f"{row['name']}")
                 with c2:
                     st.markdown(
                         f"**{row['name']}**, {row['age']} yrs — {row['gender']}  \n"

@@ -5,3 +5,7 @@ opencv-python-headless>=4.10,<5     # ← updated
 numpy==1.26.4
 pillow==10.3.0
 scipy==1.13.1
+serpapi==0.1.5
+beautifulsoup4
+requests
+python-dotenv

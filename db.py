@@ -1,5 +1,4 @@
-"""
-db.py  ·  SQLite helpers for Missing‑Person Finder
+"""db.py  ·  SQLite helpers for Missing‑Person Finder
 – auto‑creates / auto‑migrates tables on import
 – SHA‑256 password hashing (demo only; use salted hash in prod)
 """
@@ -78,6 +77,7 @@ def create_tables() -> None:
         ("contact_number", "TEXT"),
         ("aadhaar_number", "TEXT"),
         ("relation", "TEXT"),
+        ("links", "TEXT"),
     ]
     for col_name, col_type in new_cols:
         if not _column_exists(cur, "persons", col_name):
@@ -136,8 +136,8 @@ def add_person(data: dict, embedding: np.ndarray, user_id: int) -> None:
         INSERT INTO persons
         (name, age, gender, loc, gps_lat, gps_lon, date,
          notes, photo_path, embedding, address, contact_name,
-         contact_number, aadhaar_number, relation, created_by)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         contact_number, aadhaar_number, relation, links, created_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             data.get("name"),
@@ -155,6 +155,7 @@ def add_person(data: dict, embedding: np.ndarray, user_id: int) -> None:
             data.get("contact_number"),
             data.get("aadhaar_number"),
             data.get("relation"),
+            data.get("links"),
             user_id,
         ),
     )
